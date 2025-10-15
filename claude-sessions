@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+
+# Find Claude Code v2 sessions in directory and all subdirectories
+# Works on both Linux and macOS
+# Usage: ./claude-sessions [directory]
+# Default: current directory
+
+# Get target directory from argument or use current directory
+TARGET_DIR="${1:-.}"
+
+# Resolve to absolute path (cross-platform)
+if command -v realpath &> /dev/null; then
+    TARGET_DIR=$(realpath "$TARGET_DIR")
+else
+    TARGET_DIR=$(cd "$TARGET_DIR" && pwd)
+fi
+
+SESSIONS_BASE="$HOME/.claude/projects"
+
+# Colors
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Detect OS
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    IS_MAC=true
+else
+    IS_MAC=false
+fi
+
+echo -e "${BOLD}${GREEN}Claude Code Sessions${NC}"
+echo -e "${GRAY}Searching: $TARGET_DIR${NC}"
+echo ""
+
+if [ ! -d "$SESSIONS_BASE" ]; then
+    echo "No Claude Code sessions directory found at: $SESSIONS_BASE"
+    exit 1
+fi
+
+decode_path() {
+    echo "$1" | sed 's/^-/\//' | sed 's/-/\//g'
+}
+
+encode_path() {
+    echo "$1" | sed 's/\//-/g'
+}
+
+get_mtime() {
+    if [ "$IS_MAC" = true ]; then
+        stat -f %m "$1" 2>/dev/null
+    else
+        stat -c %Y "$1" 2>/dev/null
+    fi
+}
+
+# Check if a message is meaningful
+is_meaningful() {
+    local msg="$1"
+    
+    # Must have some length
+    [ ${#msg} -lt 15 ] && return 1
+    
+    # Skip various system/noise messages
+    [[ "$msg" =~ ^Caveat: ]] && return 1
+    [[ "$msg" =~ ^The\ messages\ below ]] && return 1
+    [[ "$msg" =~ ^\<command-name\> ]] && return 1
+    [[ "$msg" =~ ^\<local-command ]] && return 1
+    [[ "$msg" =~ ^/[a-z]+ ]] && return 1
+    [[ "$msg" =~ ^\[$ ]] && return 1
+    [[ "$msg" =~ ^\{$ ]] && return 1
+    [[ "$msg" =~ ^\(no\ content\) ]] && return 1
+    [[ "$msg" =~ ^Bye!$ ]] && return 1
+    
+    return 0
+}
+
+# Extract session information including first and last meaningful messages
+analyze_session() {
+    local file="$1"
+    local first_msg=""
+    local last_msg=""
+    local files_modified=()
+    local bash_commands=0
+    local edits=0
+    local user_messages=()
+    
+    if ! command -v jq &> /dev/null; then
+        echo "(install jq for details)||(no details)|0|0|"
+        return
+    fi
+    
+    # Parse JSONL to extract info
+    while IFS= read -r line; do
+        # Count tool usage
+        if echo "$line" | grep -q '"name":"bash"'; then
+            bash_commands=$((bash_commands + 1))
+        fi
+        
+        if echo "$line" | grep -q '"name":"edit"'; then
+            edits=$((edits + 1))
+            local edited_file=$(echo "$line" | jq -r '.message.content[]? | select(.type=="tool_use") | .input.path // empty' 2>/dev/null)
+            if [ -n "$edited_file" ] && [[ ! " ${files_modified[@]} " =~ " ${edited_file} " ]]; then
+                files_modified+=("$edited_file")
+            fi
+        fi
+        
+        # Collect all user messages
+        if echo "$line" | grep -q '"type":"user"'; then
+            local content=$(echo "$line" | jq -r '.message.content // .message.content[0].text // empty' 2>/dev/null)
+            if is_meaningful "$content"; then
+                user_messages+=("$content")
+            fi
+        fi
+    done < "$file"
+    
+    # Get first and last meaningful messages
+    if [ ${#user_messages[@]} -gt 0 ]; then
+        first_msg="${user_messages[0]}"
+        last_msg="${user_messages[-1]}"
+        
+        # If they're the same (only one message), just use first
+        if [ "$first_msg" = "$last_msg" ]; then
+            last_msg=""
+        fi
+    fi
+    
+    # Fallback if no meaningful messages
+    if [ -z "$first_msg" ]; then
+        if [ ${#files_modified[@]} -gt 0 ]; then
+            first_msg="(worked on ${files_modified[0]})"
+        else
+            first_msg="(session started)"
+        fi
+    fi
+    
+    # Truncate messages
+    first_msg=$(echo "$first_msg" | head -c 120 | head -n 1)
+    if [ -n "$last_msg" ]; then
+        last_msg=$(echo "$last_msg" | head -c 120 | head -n 1)
+    fi
+    
+    # Format file lists (max 3 files)
+    local modified_display=""
+    if [ ${#files_modified[@]} -gt 0 ]; then
+        local count=${#files_modified[@]}
+        modified_display=$(printf '%s' "${files_modified[@]:0:3}" | sed 's/ /, /g')
+        [ $count -gt 3 ] && modified_display="$modified_display +$((count-3)) more"
+    fi
+    
+    echo "$first_msg||$last_msg|$edits|$bash_commands|$modified_display"
+}
+
+format_relative_time() {
+    local timestamp=$1
+    local now=$(date +%s)
+    local diff=$((now - timestamp))
+    
+    if [ $diff -lt 60 ]; then
+        echo "just now"
+    elif [ $diff -lt 3600 ]; then
+        echo "$((diff / 60))m ago"
+    elif [ $diff -lt 86400 ]; then
+        echo "$((diff / 3600))h ago"
+    elif [ $diff -lt 604800 ]; then
+        echo "$((diff / 86400))d ago"
+    else
+        date -r "$timestamp" '+%b %d' 2>/dev/null || date -d "@$timestamp" '+%b %d' 2>/dev/null
+    fi
+}
+
+encoded_target=$(encode_path "$TARGET_DIR")
+temp_file=$(mktemp)
+trap "rm -f $temp_file" EXIT
+
+# Collect sessions
+for project_dir in "$SESSIONS_BASE"/*; do
+    [ ! -d "$project_dir" ] && continue
+    
+    proj_name=$(basename "$project_dir")
+    decoded_path=$(decode_path "$proj_name")
+    
+    if [[ "$decoded_path" == "$TARGET_DIR"* ]]; then
+        if [ "$IS_MAC" = true ]; then
+            find "$project_dir" -maxdepth 1 -name "*.jsonl" -type f | while read -r session_file; do
+                mod_timestamp=$(get_mtime "$session_file")
+                echo "$mod_timestamp|$session_file|$decoded_path" >> "$temp_file"
+            done
+        else
+            while IFS= read -r -d '' session_file; do
+                mod_timestamp=$(get_mtime "$session_file")
+                echo "$mod_timestamp|$session_file|$decoded_path" >> "$temp_file"
+            done < <(find "$project_dir" -maxdepth 1 -name "*.jsonl" -type f -print0)
+        fi
+    fi
+done
+
+session_count=$(wc -l < "$temp_file" 2>/dev/null | tr -d ' ')
+
+if [ "$session_count" -eq 0 ]; then
+    echo -e "${YELLOW}No sessions found${NC}"
+    echo ""
+    echo "Available directories:"
+    for dir in "$SESSIONS_BASE"/*; do
+        if [ -d "$dir" ]; then
+            echo -e "  ${GRAY}$(decode_path "$(basename "$dir")")${NC}"
+        fi
+    done
+    exit 0
+fi
+
+# Process and display
+sort -t'|' -k1 -rn "$temp_file" | while IFS='|' read -r mod_timestamp session_file decoded_path; do
+    session_id=$(basename "$session_file" .jsonl)
+    short_id="${session_id:0:8}"
+    msg_count=$(wc -l < "$session_file" 2>/dev/null | tr -d ' ')
+    rel_time=$(format_relative_time "$mod_timestamp")
+    
+    # Analyze session
+    analysis=$(analyze_session "$session_file")
+    first_msg=$(echo "$analysis" | cut -d'|' -f1)
+    last_msg=$(echo "$analysis" | cut -d'|' -f3)
+    edits=$(echo "$analysis" | cut -d'|' -f4)
+    bash_cmds=$(echo "$analysis" | cut -d'|' -f5)
+    modified_files=$(echo "$analysis" | cut -d'|' -f6)
+    
+    # Make relative path
+    display_path="$decoded_path"
+    if [[ "$decoded_path" == "$TARGET_DIR"* ]]; then
+        display_path=".${decoded_path#$TARGET_DIR}"
+        [ "$display_path" = "." ] && display_path="./"
+    fi
+    
+    # Build activity indicators
+    activity=""
+    [ "$edits" -gt 0 ] && activity="${activity}${YELLOW}✎${edits}${NC} "
+    [ "$bash_cmds" -gt 0 ] && activity="${activity}${BLUE}▶${bash_cmds}${NC} "
+    
+    # Display compact line
+    echo -e "${CYAN}${short_id}${NC}  ${GRAY}${rel_time}${NC}  ${MAGENTA}${display_path}${NC}  ${GRAY}(${msg_count} msgs)${NC}  ${activity}"
+    echo -e "  ${GREEN}Started:${NC} ${first_msg}"
+    
+    # Show last message if different from first
+    if [ -n "$last_msg" ]; then
+        echo -e "  ${GREEN}Ended:${NC} ${last_msg}"
+    fi
+    
+    # Show modified files if any
+    if [ -n "$modified_files" ]; then
+        echo -e "  ${GRAY}Modified: ${modified_files}${NC}"
+    fi
+    
+    echo -e "  ${GRAY}claude --resume $session_id${NC}"
+    echo ""
+done
+
+echo -e "${GRAY}────────────────────────────────────────${NC}"
+echo -e "${GREEN}$session_count session(s)${NC}  ${GRAY}Legend: ✎edits ▶bash${NC}"
